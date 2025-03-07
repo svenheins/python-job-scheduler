@@ -137,27 +137,32 @@ class JobScheduler:
                 
 
 
+
 def main():
     parser = argparse.ArgumentParser(description="Job scheduler for managing input file processing")
     subparsers = parser.add_subparsers(dest="command")
-    
+
     # Add job command
     add_parser = subparsers.add_parser("add", help="Add job(s) to the queue")
     add_parser.add_argument("--input-file", help="Single input file to process")
     add_parser.add_argument("--input-dir", help="Directory with input files to process")
     add_parser.add_argument("--pattern", default="*", help="File pattern to match in input directory")
-    
+
     # Run jobs command
     run_parser = subparsers.add_parser("run", help="Run pending jobs")
     run_parser.add_argument("--max-jobs", type=int, help="Maximum number of jobs to run")
-    
+
     # List jobs command
     list_parser = subparsers.add_parser("list", help="List all jobs")
     list_parser.add_argument("--status", help="Filter by status")
-    
+
+    # Monitor command
+    monitor_parser = subparsers.add_parser("monitor", help="Monitor a directory for new files")
+    monitor_parser.add_argument("--monitor-dir", help="Directory to monitor")
+
     args = parser.parse_args()
     scheduler = JobScheduler()
-    
+
     if args.command == "add":
         if args.input_file:
             scheduler.add_job(os.path.abspath(args.input_file))
@@ -167,24 +172,24 @@ def main():
             for file_path in glob.glob(pattern):
                 if os.path.isfile(file_path):
                     scheduler.add_job(file_path)
-    
+
     elif args.command == "run":
         scheduler.run_pending_jobs(args.max_jobs)
-    
+
     elif args.command == "list":
         conn = sqlite3.connect(scheduler.db_path)
         cursor = conn.cursor()
-        
+
         query = "SELECT id, input_file, status, start_time, end_time, attempts FROM jobs"
         params = []
-        
+
         if args.status:
             query += " WHERE status = ?"
             params.append(args.status)
-        
+
         cursor.execute(query, params)
         jobs = cursor.fetchall()
-        
+
         if not jobs:
             print("No jobs found.")
         else:
@@ -192,8 +197,21 @@ def main():
             print("-" * 80)
             for job in jobs:
                 print(" | ".join(str(field) if field is not None else "-" for field in job))
-        
+
         conn.close()
 
+    
+    elif args.command == "monitor":
+        import os
+        import glob
+        import time
+    
+        monitor_dir = os.path.abspath(args.monitor_dir)
+        while True:
+            for root, dirs, files in os.walk(monitor_dir):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    scheduler.add_job(file_path)
+            time.sleep(5)  # wait for 1 minute before checking again
 if __name__ == "__main__":
     main()
