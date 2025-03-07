@@ -2,8 +2,10 @@ import sqlite3
 import os
 import subprocess
 import argparse
+import json
 import logging
 from datetime import datetime
+import time
 
 # Set up logging
 logging.basicConfig(
@@ -69,6 +71,8 @@ class JobScheduler:
         return jobs
     
     def run_job(self, job_id, input_file):
+        with open('command.json') as f:
+            command_config = json.load(f)
         """Execute the job and update its status"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
@@ -85,7 +89,8 @@ class JobScheduler:
         
         try:
             # Run the actual script
-            cmd = ["python", "run_script.py", "--input-file", input_file]
+            cmd = [cmd_i for cmd_i in command_config.values()]
+            cmd.extend(["--input-file", input_file])
             process = subprocess.run(cmd, check=True)
             exit_code = process.returncode
             status = "completed" if exit_code == 0 else "failed"
@@ -109,13 +114,27 @@ class JobScheduler:
     
     def run_pending_jobs(self, max_jobs=None):
         """Run all pending jobs, optionally limited to max_jobs"""
-        pending_jobs = self.get_pending_jobs()
-        
-        if max_jobs:
-            pending_jobs = pending_jobs[:max_jobs]
-        
-        for job_id, input_file in pending_jobs:
-            self.run_job(job_id, input_file)
+        waiting_timer = 1
+        while True:
+            pending_jobs = self.get_pending_jobs()
+            
+            if max_jobs:
+                pending_jobs = pending_jobs[:max_jobs]
+            
+            logging.info(f"Running {len(pending_jobs)} jobs...")
+            for job_id, input_file in pending_jobs:
+                waiting_timer = 1
+                self.run_job(job_id, input_file)
+            logging.info("All jobs completed. Waiting for more jobs...")
+            
+            if not pending_jobs:
+                # wait for some time before checking again
+                waiting_timer *= 2
+                waiting_timer = min(waiting_timer, 300)
+                logging.info(f"No more pending jobs. Waiting for {waiting_timer} seconds before checking again...")
+                time.sleep(waiting_timer)
+                
+                
 
 
 def main():
