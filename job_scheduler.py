@@ -6,6 +6,8 @@ import json
 import logging
 from datetime import datetime
 import time
+import threading
+import glob
 
 # Set up logging
 logging.basicConfig(
@@ -18,6 +20,7 @@ class JobScheduler:
     def __init__(self, db_path="jobs.db"):
         self.db_path = db_path
         self.setup_database()
+        self._stop_event = threading.Event()
     
     def setup_database(self):
         """Create the database and tables if they don't exist"""
@@ -71,9 +74,14 @@ class JobScheduler:
         return jobs
     
     def run_job(self, job_id, input_file):
-        with open('command.json') as f:
-            command_config = json.load(f)
         """Execute the job and update its status"""
+        try:
+            with open('command.json') as f:
+                command_config = json.load(f)
+        except Exception as e:
+            logging.error(f"Error loading command.json: {e}")
+            return "failed"
+            
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
@@ -115,27 +123,59 @@ class JobScheduler:
     def run_pending_jobs(self, max_jobs=None):
         """Run all pending jobs, optionally limited to max_jobs"""
         waiting_timer = 1
-        while True:
+        while not self._stop_event.is_set():
             pending_jobs = self.get_pending_jobs()
             
             if max_jobs:
                 pending_jobs = pending_jobs[:max_jobs]
             
-            logging.info(f"Running {len(pending_jobs)} jobs...")
-            for job_id, input_file in pending_jobs:
-                waiting_timer = 1
-                self.run_job(job_id, input_file)
-            logging.info("All jobs completed. Waiting for more jobs...")
-            
-            if not pending_jobs:
+            if pending_jobs:
+                logging.info(f"Running {len(pending_jobs)} jobs...")
+                for job_id, input_file in pending_jobs:
+                    waiting_timer = 1
+                    self.run_job(job_id, input_file)
+                logging.info("All jobs completed. Waiting for more jobs...")
+            else:
                 # wait for some time before checking again
                 waiting_timer *= 2
                 waiting_timer = min(waiting_timer, 300)
                 logging.info(f"No more pending jobs. Waiting for {waiting_timer} seconds before checking again...")
-                time.sleep(waiting_timer)
+                # Use stop_event.wait() instead of time.sleep() to allow graceful shutdown
+                self._stop_event.wait(waiting_timer)
+    
+    def monitor_directory(self, monitor_dir, pattern="*"):
+        """Monitor a directory for new files and add them as jobs"""
+        monitor_dir = os.path.abspath(monitor_dir)
+        logging.info(f"Starting to monitor directory: {monitor_dir}")
+        
+        processed_files = set()
+        
+        while not self._stop_event.is_set():
+            current_files = set()
+            try:
+                # Use glob to find all files matching the pattern
+                pattern_path = os.path.join(monitor_dir, pattern)
+                for file_path in glob.glob(pattern_path):
+                    if os.path.isfile(file_path):
+                        current_files.add(file_path)
                 
+                # Find new files
+                new_files = current_files - processed_files
+                for file_path in new_files:
+                    self.add_job(file_path)
                 
-
+                # Update processed files
+                processed_files = current_files
+            
+            except Exception as e:
+                logging.error(f"Error monitoring directory: {e}")
+            
+            # Check every 5 seconds
+            self._stop_event.wait(5)
+    
+    def stop(self):
+        """Signal all threads to stop"""
+        self._stop_event.set()
 
 
 def main():
@@ -158,7 +198,14 @@ def main():
 
     # Monitor command
     monitor_parser = subparsers.add_parser("monitor", help="Monitor a directory for new files")
-    monitor_parser.add_argument("--monitor-dir", help="Directory to monitor")
+    monitor_parser.add_argument("--monitor-dir", required=True, help="Directory to monitor")
+    monitor_parser.add_argument("--pattern", default="*", help="File pattern to match in monitored directory")
+    
+    # Combined monitor and run command
+    monitor_run_parser = subparsers.add_parser("monitor-and-run", help="Monitor a directory and run jobs")
+    monitor_run_parser.add_argument("--monitor-dir", required=True, help="Directory to monitor")
+    monitor_run_parser.add_argument("--pattern", default="*", help="File pattern to match in monitored directory")
+    monitor_run_parser.add_argument("--max-jobs", type=int, help="Maximum number of jobs to run")
 
     args = parser.parse_args()
     scheduler = JobScheduler()
@@ -167,14 +214,17 @@ def main():
         if args.input_file:
             scheduler.add_job(os.path.abspath(args.input_file))
         elif args.input_dir:
-            import glob
             pattern = os.path.join(os.path.abspath(args.input_dir), args.pattern)
             for file_path in glob.glob(pattern):
                 if os.path.isfile(file_path):
                     scheduler.add_job(file_path)
 
     elif args.command == "run":
-        scheduler.run_pending_jobs(args.max_jobs)
+        try:
+            scheduler.run_pending_jobs(args.max_jobs)
+        except KeyboardInterrupt:
+            logging.info("Received keyboard interrupt, shutting down...")
+            scheduler.stop()
 
     elif args.command == "list":
         conn = sqlite3.connect(scheduler.db_path)
@@ -200,18 +250,29 @@ def main():
 
         conn.close()
 
-    
     elif args.command == "monitor":
-        import os
-        import glob
-        import time
-    
-        monitor_dir = os.path.abspath(args.monitor_dir)
-        while True:
-            for root, dirs, files in os.walk(monitor_dir):
-                for file in files:
-                    file_path = os.path.join(root, file)
-                    scheduler.add_job(file_path)
-            time.sleep(5)  # wait for 1 minute before checking again
+        try:
+            scheduler.monitor_directory(args.monitor_dir, args.pattern)
+        except KeyboardInterrupt:
+            logging.info("Received keyboard interrupt, shutting down...")
+            scheduler.stop()
+            
+    elif args.command == "monitor-and-run":
+        try:
+            # Start monitor thread
+            monitor_thread = threading.Thread(
+                target=scheduler.monitor_directory, 
+                args=(args.monitor_dir, args.pattern)
+            )
+            monitor_thread.daemon = True
+            monitor_thread.start()
+            
+            # Run jobs in the main thread
+            scheduler.run_pending_jobs(args.max_jobs)
+        except KeyboardInterrupt:
+            logging.info("Received keyboard interrupt, shutting down...")
+            scheduler.stop()
+
+
 if __name__ == "__main__":
     main()
