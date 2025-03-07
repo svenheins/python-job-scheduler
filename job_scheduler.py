@@ -60,6 +60,39 @@ class JobScheduler:
         finally:
             conn.close()
     
+    def remove_job(self, input_file):
+        """Remove a job from the database"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        try:
+            # First, log the job status before deletion
+            cursor.execute("SELECT id, status FROM jobs WHERE input_file = ?", (input_file,))
+            job = cursor.fetchone()
+            
+            if job:
+                job_id, status = job
+                cursor.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+                conn.commit()
+                logging.info(f"Removed job {job_id} for input file: {input_file} (previous status: {status})")
+            else:
+                logging.warning(f"Attempted to remove non-existent job for file: {input_file}")
+        except sqlite3.Error as e:
+            logging.error(f"Error removing job: {e}")
+        finally:
+            conn.close()
+    
+    def get_all_job_files(self):
+        """Get all files registered in the database"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT input_file FROM jobs")
+        job_files = [row[0] for row in cursor.fetchall()]
+        conn.close()
+        
+        return job_files
+    
     def get_pending_jobs(self):
         """Get all jobs that haven't been completed successfully"""
         conn = sqlite3.connect(self.db_path)
@@ -81,6 +114,12 @@ class JobScheduler:
         except Exception as e:
             logging.error(f"Error loading command.json: {e}")
             return "failed"
+        
+        # Check if file still exists before processing
+        if not os.path.exists(input_file):
+            logging.warning(f"Input file {input_file} no longer exists. Removing job {job_id}")
+            self.remove_job(input_file)
+            return "removed"
             
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
@@ -144,10 +183,11 @@ class JobScheduler:
                 self._stop_event.wait(waiting_timer)
     
     def monitor_directory(self, monitor_dir, pattern="*"):
-        """Monitor a directory for new files and add them as jobs"""
+        """Monitor a directory for new files and removed files"""
         monitor_dir = os.path.abspath(monitor_dir)
         logging.info(f"Starting to monitor directory: {monitor_dir}")
         
+        # Keep track of processed files
         processed_files = set()
         
         while not self._stop_event.is_set():
@@ -159,10 +199,18 @@ class JobScheduler:
                     if os.path.isfile(file_path):
                         current_files.add(file_path)
                 
-                # Find new files
+                # Find new files and add them
                 new_files = current_files - processed_files
                 for file_path in new_files:
                     self.add_job(file_path)
+                
+                # Find removed files and delete them from the database
+                removed_files = processed_files - current_files
+                for file_path in removed_files:
+                    self.remove_job(file_path)
+                
+                # Additionally, check all files in the database and remove any that don't exist
+                self.sync_database_with_filesystem(monitor_dir, pattern)
                 
                 # Update processed files
                 processed_files = current_files
@@ -172,6 +220,19 @@ class JobScheduler:
             
             # Check every 5 seconds
             self._stop_event.wait(5)
+    
+    def sync_database_with_filesystem(self, monitor_dir=None, pattern=None):
+        """Ensure database is in sync with the filesystem by removing entries for non-existent files"""
+        try:
+            all_job_files = self.get_all_job_files()
+            for file_path in all_job_files:
+                # Only check files that should be in the monitored directory
+                if monitor_dir is None or (file_path.startswith(monitor_dir) and os.path.basename(file_path) == pattern):
+                    if not os.path.exists(file_path):
+                        logging.info(f"File {file_path} no longer exists. Removing from database")
+                        self.remove_job(file_path)
+        except Exception as e:
+            logging.error(f"Error syncing database with filesystem: {e}")
     
     def stop(self):
         """Signal all threads to stop"""
@@ -206,6 +267,9 @@ def main():
     monitor_run_parser.add_argument("--monitor-dir", required=True, help="Directory to monitor")
     monitor_run_parser.add_argument("--pattern", default="*", help="File pattern to match in monitored directory")
     monitor_run_parser.add_argument("--max-jobs", type=int, help="Maximum number of jobs to run")
+    
+    # Sync command
+    sync_parser = subparsers.add_parser("sync", help="Sync database with filesystem (remove entries for missing files)")
 
     args = parser.parse_args()
     scheduler = JobScheduler()
@@ -272,6 +336,10 @@ def main():
         except KeyboardInterrupt:
             logging.info("Received keyboard interrupt, shutting down...")
             scheduler.stop()
+    
+    elif args.command == "sync":
+        scheduler.sync_database_with_filesystem()
+        print("Database synchronized with filesystem.")
 
 
 if __name__ == "__main__":
