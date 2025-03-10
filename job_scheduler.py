@@ -149,6 +149,7 @@ class JobScheduler:
             # Run the actual script
             cmd = [cmd_i for cmd_i in command_config.values()]
             cmd.extend(["--input_file", input_file])
+            logging.info(f"Job = {str(cmd)}")
             process = subprocess.run(cmd, check=True)
             exit_code = process.returncode
             status = "completed" if exit_code == 0 else "failed"
